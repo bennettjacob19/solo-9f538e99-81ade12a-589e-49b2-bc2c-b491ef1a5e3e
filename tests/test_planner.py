@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
-
 import pytest
 
 from app.planner.models import PlanningError
@@ -269,9 +267,9 @@ def test_multi_consumer_liveness():
 
 
 # --------------------------------------------------------------------------- #
-# 10. 最优性暴力对照：穷举全部有序 bin 划分，DP 结果必须与暴力最优一致
+# 10. 最优性暴力对照：枚举干扰边方向 + 最左放置，求解器结果必须与暴力最优一致
 # --------------------------------------------------------------------------- #
-def test_dp_matches_brute_force_partitions():
+def test_solver_matches_brute_force_exact_layout():
     data = make_input(
         ["a1", "a2", "a3", "a4"],
         ["b1", "b2", "b3", "b4"],
@@ -290,42 +288,184 @@ def test_dp_matches_brute_force_partitions():
     result = solve_allocation(data, interfere)
 
     n = len(data.tensors)
+    sizes = [t.size for t in data.tensors]
+    aligns = [t.alignment for t in data.tensors]
 
     def align_up(v: int, a: int) -> int:
         return (v + a - 1) & ~(a - 1)
 
-    # 穷举全部集合划分（Bell 数 B5=52，量很小），只保留每个块都是独立集的方案
-    def all_partitions(items: tuple[int, ...]) -> list[list[list[int]]]:
-        if not items:
-            return [[]]
-        head, rest = items[0], items[1:]
-        out: list[list[list[int]]] = []
-        for tail in all_partitions(rest):
-            for k in range(len(tail)):
-                trial = [list(b) for b in tail]
-                trial[k].append(head)
-                out.append(trial)
-            out.append([[head], *tail])
-        return out
-
-    def independent(block: list[int]) -> bool:
-        return all(not interfere[i][j] for i, j in itertools.combinations(block, 2))
-
+    # 精确预言机：枚举每条干扰边的先后方向（i 先死或 j 先死），
+    # 方向集无环时按拓扑序做对齐最左放置，取最小跨度。
+    conflict_edges = [
+        (i, j) for i in range(n) for j in range(i + 1, n) if interfere[i][j]
+    ]
     brute_best = None
-    for partition in all_partitions(tuple(range(n))):
-        if not all(independent(block) for block in partition):
-            continue
-        # bin 顺序也做全排列，取最小
-        for ordered in itertools.permutations(partition):
-            cursor = 0
-            for block in ordered:
-                balign = max(data.tensors[i].alignment for i in block)
-                bsize = max(data.tensors[i].size for i in block)
-                cursor = align_up(cursor, balign) + bsize
-            brute_best = cursor if brute_best is None else min(brute_best, cursor)
 
+    def layout_for_orientation(before: list[set[int]]) -> int | None:
+        order: list[int] = []
+        remaining = set(range(n))
+        while remaining:
+            ready = sorted(i for i in remaining if not (before[i] & remaining))
+            if not ready:
+                return None  # 方向成环
+            order.append(ready[0])
+            remaining.remove(ready[0])
+        off: dict[int, int] = {}
+        for i in order:
+            # 候选包含全部已放置张量（含非干扰张量）的对齐尾部，
+            # 可行性才只检查干扰张量——否则会漏掉洞里的位置
+            cands = {0}
+            for j in off:
+                cands.add(align_up(off[j] + sizes[j], aligns[i]))
+            off[i] = min(
+                c for c in cands
+                if all(
+                    not interfere[i][j]
+                    or c + sizes[i] <= off[j]
+                    or off[j] + sizes[j] <= c
+                    for j in off
+                )
+            )
+        return max(off[i] + sizes[i] for i in range(n))
+
+    def recurse(k: int, before: list[set[int]]) -> None:
+        nonlocal brute_best
+        if k == len(conflict_edges):
+            span = layout_for_orientation(before)
+            if span is not None:
+                brute_best = span if brute_best is None else min(brute_best, span)
+            return
+        i, j = conflict_edges[k]
+        b1 = [set(s) for s in before]
+        b1[j].add(i)  # i 先于 j
+        recurse(k + 1, b1)
+        b2 = [set(s) for s in before]
+        b2[i].add(j)  # j 先于 i
+        recurse(k + 1, b2)
+
+    recurse(0, [set() for _ in range(n)])
     assert brute_best is not None
     assert result.total_bytes == brute_best
+
+
+# --------------------------------------------------------------------------- #
+# 10b. 碎片复用回归：互不干扰的张量可在不同偏移复用同一段显存（旧 bin 模型会漏）
+# --------------------------------------------------------------------------- #
+def test_non_interfering_tensors_reuse_region_at_different_offsets():
+    # 干扰图仅 TS1-TS2 一条边；TB(100B) 与两个 1B 小张量都不干扰。
+    # 精确最优：TS1@0、TB@0、TS2@1 -> 跨度 100；
+    # 旧 bin 模型强制同箱共享起始偏移，只能得到 101。
+    data = make_input(
+        ["a1", "a2", "a3", "a4", "a5"],
+        ["b1", "b2"],
+        [
+            {"name": "TS1", "producer": "a1", "consumers": ["a2"], "size": 1, "alignment": 1},
+            {"name": "TS2", "producer": "b1", "consumers": ["b2"], "size": 1, "alignment": 1},
+            {"name": "TB", "producer": "a3", "consumers": ["a4"], "size": 100, "alignment": 1},
+        ],
+        budget=100,
+        waits=[("a3", "b2")],  # b2 -> a3：TS2 先死、TB 才生，二者不干扰
+    )
+    out = plan(data)
+    # 原依赖下精确占用 100 即满足预算：不得误报无解，也不得新增等待
+    assert out.feasible and out.added_wait is None
+    assert out.total_bytes == 100
+    # TB 与 TS1 生命周期不相交，复用同一偏移 0；TS2 占 TB 区间内的 1 字节洞
+    assert out.offsets["TB"] == out.offsets["TS1"] == 0
+    assert out.offsets["TS2"] == 1
+    assert_layout_valid(data, out, True)
+
+
+def test_alignment_hole_reuse_avoids_false_infeasible():
+    # 对齐取整产生的洞也必须能被复用：
+    # 干扰图仅 TS1-TS2 一条边，TB(100B) 与两个 4B 小张量都不干扰。
+    # 精确最优：TS1@0、TB@0（复用）、TS2@4（落在 TB 区间的洞内）-> 跨度 100。
+    # 旧 bin 模型强制同箱共享起始偏移：bin{TS1,TB} 占 100 后再接 bin{TS2}，
+    # 拼接按 4 对齐得到 104；预算 100 时旧实现会误判无解或强加跨流等待。
+    data = make_input(
+        ["a1", "a2", "a3", "a4", "a5"],
+        ["b1", "b2"],
+        [
+            {"name": "TS1", "producer": "a1", "consumers": ["a2"], "size": 4, "alignment": 4},
+            {"name": "TS2", "producer": "b1", "consumers": ["b2"], "size": 4, "alignment": 4},
+            {"name": "TB", "producer": "a3", "consumers": ["a4"], "size": 100, "alignment": 1},
+        ],
+        budget=100,
+        waits=[("a3", "b2")],  # b2 -> a3：TS2 先死、TB 才生，二者不干扰
+    )
+    out = plan(data)
+    assert out.feasible and out.added_wait is None
+    assert out.total_bytes == 100
+    assert out.offsets["TB"] == out.offsets["TS1"] == 0
+    assert out.offsets["TS2"] == 4
+    assert_layout_valid(data, out, True)
+
+
+# --------------------------------------------------------------------------- #
+# 13. 服务级 fuzz：紧预算下用独立暴力枚举复核等待选择/无解/最小占用
+# --------------------------------------------------------------------------- #
+def test_service_wait_selection_matches_brute_force_fuzz():
+    import random
+
+    from app.planner.models import Wait as WaitModel
+    from app.planner.solver import candidate_waits
+
+    rng = random.Random(20261124)
+    for _ in range(120):
+        na, nb = rng.randint(2, 5), rng.randint(2, 5)
+        A = [f"a{i}" for i in range(na)]
+        B = [f"b{i}" for i in range(nb)]
+        n_tensors = rng.randint(2, min(6, na + nb - 1))
+        tensors = []
+        for k in range(n_tensors):
+            if rng.random() < 0.5:
+                p = rng.randrange(na - 1)
+                tensors.append(
+                    {"name": f"T{k}", "producer": A[p],
+                     "consumers": [A[rng.randrange(p + 1, na)]],
+                     "size": rng.choice([1, 16, 100, 300]),
+                     "alignment": rng.choice([1, 8, 64])}
+                )
+            else:
+                p = rng.randrange(nb - 1)
+                tensors.append(
+                    {"name": f"T{k}", "producer": B[p],
+                     "consumers": [B[rng.randrange(p + 1, nb)]],
+                     "size": rng.choice([1, 16, 100, 300]),
+                     "alignment": rng.choice([1, 8, 64])}
+                )
+        data = make_input(A, B, tensors, budget=rng.choice([1, 50, 150, 300]))
+
+        base_edges = build_base_edges(data)
+        base_reach = reachability(base_edges, data.all_operators())
+        base_alloc = solve_allocation(data, build_interference(data, base_reach))
+        brute = [(base_alloc.total_bytes, None)]
+        for w in candidate_waits(data, base_edges, base_reach):
+            edges = set(base_edges)
+            edges.add((w.waitee, w.waiter))
+            reach = reachability(edges, data.all_operators())
+            res = solve_allocation(data, build_interference(data, reach))
+            brute.append((res.total_bytes, (w.waiter, w.waitee)))
+
+        out = plan(data)
+        best_total = min(t for t, _ in brute)
+        if base_alloc.feasible:
+            assert out.added_wait is None and out.feasible
+            continue
+        if best_total <= data.budget_bytes:
+            assert out.feasible
+            # 字典序最小的最优等待
+            best_wait = min(
+                (w for t, w in brute if t == best_total and w is not None),
+                default=None,
+            )
+            assert out.added_wait == WaitModel(*best_wait)
+            assert out.total_bytes == best_total
+            assert_layout_valid(data, out, True)
+        else:
+            assert not out.feasible
+            assert out.offsets == {} and out.bins == []
+            assert out.best_effort_total_bytes == best_total
 
 
 # --------------------------------------------------------------------------- #

@@ -1,17 +1,34 @@
 """依赖分析与最优显存布局求解器。
 
-只使用 Python 标准库。张量数上限为 8，采用基于“互不干扰张量组”（bin）划分的
-子集 DP 求精确最优解，复杂度 O(3^n)，n=8 时仅 6561 次状态评估。
+只使用 Python 标准库。张量数上限为 8。
 
-关键结论（见 README“规划语义”）：两个张量允许复用同一字节区间，当且仅当在
-依赖偏序中一个张量的最后消费者 happens-before 另一个张量的生产者。把所有两两
-互不干扰的张量放进同一个 bin、共享起始偏移，按 bin 顺序拼接得到的连续布局
-与允许碎片化留洞的全局最优 1D 装箱等优，因此 DP 枚举 bin 划分即可得到最优解。
+布局模型
+========
+两个张量允许在字节上重叠，当且仅当在依赖偏序中一个张量的最后消费者
+happens-before 另一个张量的生产者（见 ``build_interference``）。其余张量对
+构成“干扰边”：在某些合法时序下会同时在用，字节区间不得重叠。
+
+与旧实现的区别
+--------------
+旧实现把“互不干扰”的张量强行放进同一个 bin、强制共享**同一个起始偏移**，
+再按 bin 拼接。这会错过两类合法布局：
+
+1. 两个互不干扰的张量本可复用同一段显存的**不同偏移**（一个占头部、另一个
+   占尾部的洞），bin 划分却只能让它们同起点或完全错开；
+2. 对齐取整产生的碎片无法被后续张量利用。
+
+本实现改为枚举张量的**放置顺序**（n! 种，n<=8 时最多 40320 种）：每个
+张量在其放置时刻的候选偏移只有 0 与所有已放置张量（含非干扰张量，以便
+利用它们尾部的洞）尾部的对齐值，取其中最小的可行值。枚举全部顺序即覆盖
+每个最优布局对应的最左放置序列，从而得到允许碎片化留洞的精确最优布局。
+
+搜索规模只取决于张量数 n（O(n!·n²)）与各张量的尺寸/对齐，**不随显存
+字节数增长**：候选偏移只有 0 和已放置张量的对齐尾部，从不按字节扫描。
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
+from itertools import permutations
 
 from .models import AllocationResult, PlanningError, PlanningInput, TensorSpec, Wait
 
@@ -227,7 +244,29 @@ def validate_tensor_lifecycles(
 
 
 # --------------------------------------------------------------------------- #
-# 最优布局：独立集 bin 划分 + 子集 DP
+# 干扰关系签名：同一请求中相同干扰关系只求解一次
+# --------------------------------------------------------------------------- #
+def interference_signature(
+    data: PlanningInput,
+    interfere: list[list[bool]],
+) -> tuple:
+    """可哈希的干扰关系签名。
+
+    干扰矩阵决定“谁能与谁重叠”，而尺寸与对齐决定布局代价；同一请求里
+    张量集合不变，因此签名 = 上三角干扰位 + 每个张量的 (尺寸, 对齐)。
+    """
+    n = len(data.tensors)
+    bits = tuple(
+        bool(interfere[i][j])
+        for i in range(n)
+        for j in range(i + 1, n)
+    )
+    specs = tuple((t.size, t.alignment) for t in data.tensors)
+    return (n, bits, specs)
+
+
+# --------------------------------------------------------------------------- #
+# 最优布局：枚举放置顺序 + 每步最左可行对齐偏移
 # --------------------------------------------------------------------------- #
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) & ~(alignment - 1)
@@ -236,105 +275,144 @@ def _align_up(value: int, alignment: int) -> int:
 def solve_allocation(
     data: PlanningInput,
     interfere: list[list[bool]],
+    upper_bound: int | None = None,
 ) -> AllocationResult:
-    """在给定干扰图下求满足对齐的最小连续显存布局。
+    """在给定干扰图下求满足对齐的最小连续显存布局（精确最优）。
 
-    DP 按 bin 顺序拼接；bin 内张量共享同一个起始偏移，bin 的对齐要求取内部
-    最严格者，bin 大小取内部最大张量尺寸。
+    枚举全部 n! 个放置顺序（``itertools.permutations`` 按字典序产出）。
+    每个顺序中，张量的候选偏移只有 0 与所有**已放置**张量（含非干扰张量，
+    以便钻进它们尾部的洞）尾部按本张量对齐向上取整的值，取其中最小的可行
+    值；可行性只检查干扰张量，非干扰张量允许字节重叠。
+
+    候选点数量与显存字节数无关，搜索规模只取决于张量数 n：
+    O(n!·n²)，n<=8 时最多 40320 个顺序。
+
+    剪枝：先用下标序贪心造一个可行解作为初始上界；若调用方给出
+    ``upper_bound``（只关心是否存在占用不超过它的布局），取二者中较小者
+    作为初始上界。单个放置顺序内跨度单调不减，部分跨度一旦**严格大于**
+    当前上界即可中止该顺序。上界随更优解不断收紧。注意：传入的
+    upper_bound 只用于剪枝，返回值始终是真实最小占用（剪枝不会误杀等于
+    上界的最优解），调用方无需区分。
+
+    完备性：设存在最优布局 L，按 L 中起始偏移从小到大（并列按张量 id）作为
+    放置顺序，L 给每个张量的偏移在其放置时刻都是一个可行候选，而“取最左
+    可行偏移”不会比 L 的偏移更靠右——故该顺序的贪心放置占用不大于 L，
+    枚举全部顺序必然复现最优占用。
+
+    同占用下的确定性 tie-break：偏移向量 (off_0, ..., off_{n-1}) 字典序最小。
     """
     tensors = data.tensors
     n = len(tensors)
-    size = [t.size for t in tensors]
-    align = [t.alignment for t in tensors]
+    sizes = [t.size for t in tensors]
+    aligns = [t.alignment for t in tensors]
 
-    full = (1 << n) - 1
+    # 预计算每个张量的干扰邻接位掩码，加速可行性判定
+    conflict_mask = [0] * n
+    for i in range(n):
+        m = 0
+        for j in range(n):
+            if interfere[i][j]:
+                m |= 1 << j
+        conflict_mask[i] = m
 
-    # 独立集（两两不干扰）枚举：indep[mask] 表示 mask 是否可放进同一个 bin
-    indep: dict[int, bool] = {0: True}
-    for mask in range(1, full + 1):
-        low = mask & -mask
-        i = low.bit_length() - 1
-        rest = mask ^ low
-        ok = indep[rest]
-        if ok:
-            bits = rest
+    def place_one(i: int, offsets: list[int], placed_mask: int) -> int:
+        # 候选起点：0，以及每个已放置张量 j（含非干扰张量）的对齐尾部。
+        # 非干扰张量的尾部必须纳入，否则会漏掉其后面洞里的可行位置。
+        # n<=8，用线性插入维护有序候选，避免集合/排序开销。
+        candidates = [0]
+        placed_bits = placed_mask
+        ai = aligns[i]
+        while placed_bits:
+            b = placed_bits & -placed_bits
+            j = b.bit_length() - 1
+            c = _align_up(offsets[j] + sizes[j], ai)
+            if c not in candidates:
+                candidates.append(c)
+            placed_bits ^= b
+        candidates.sort()
+
+        cbm = conflict_mask[i] & placed_mask
+        si = sizes[i]
+        for c in candidates:
+            end = c + si
+            # 只要求与已放置的干扰张量区间不相交；非干扰张量允许重叠
+            bits = cbm
+            ok = True
             while bits:
                 b = bits & -bits
                 j = b.bit_length() - 1
-                if interfere[i][j]:
+                if not (end <= offsets[j] or offsets[j] + sizes[j] <= c):
                     ok = False
                     break
                 bits ^= b
-        indep[mask] = ok
+            if ok:
+                return c
+        raise AssertionError("候选 0 始终可行，不可能走到这里")
 
-    # bin 的尺寸与对齐
-    @lru_cache(maxsize=None)
-    def bin_metrics(mask: int) -> tuple[int, int]:
-        s, a = 0, 1
-        bits = mask
-        while bits:
-            b = bits & -bits
-            i = b.bit_length() - 1
-            s = max(s, size[i])
-            a = max(a, align[i])
-            bits ^= b
-        return s, a
+    # 初始上界：下标序贪心最左放置，必然可行
+    greedy_off = [0] * n
+    mask = 0
+    for i in range(n):
+        greedy_off[i] = place_one(i, greedy_off, mask)
+        mask |= 1 << i
+    greedy_total = max(greedy_off[i] + sizes[i] for i in range(n))
+    incumbent = greedy_total
+    best_offsets: tuple[int, ...] = tuple(greedy_off)
 
-    # dp[mask] = (最小总字节, 该最优值下字典序最小的 bin 序列)
-    # bin 序列用 tuple[int, ...] 表示，每个元素是一个 bin 的张量位掩码。
-    @lru_cache(maxsize=None)
-    def dp(mask: int) -> tuple[int, tuple[int, ...]]:
-        if mask == 0:
-            return 0, ()
-        best_total: int | None = None
-        best_bins: tuple[int, ...] | None = None
-        sub = mask
-        while sub:
-            if indep[sub]:
-                bsize, balign = bin_metrics(sub)
-                tail_total, tail_bins = dp(mask ^ sub)
-                # 前一个 bin 的结束地址需要按本 bin 对齐向上取整
-                prev_end = tail_total
-                start = _align_up(prev_end, balign)
-                total = start + bsize
-                bins = tail_bins + (sub,)
-                if (
-                    best_total is None
-                    or total < best_total
-                    or (total == best_total and bins < best_bins)
-                ):
-                    best_total = total
-                    best_bins = bins
-            sub = (sub - 1) & mask
-        assert best_total is not None and best_bins is not None
-        return best_total, best_bins
+    # 调用方给定上界时用它加强剪枝；只取不大于贪心得分的值，
+    # 避免初始最优记录被一个无法实现的上界污染
+    prune_bound = incumbent
+    if upper_bound is not None and upper_bound < prune_bound:
+        prune_bound = upper_bound
 
-    total, bin_masks = dp(full)
+    for order in permutations(range(n)):
+        offsets = [0] * n
+        placed_mask = 0
+        span = 0
+        aborted = False
+        for i in order:
+            c = place_one(i, offsets, placed_mask)
+            offsets[i] = c
+            placed_mask |= 1 << i
+            end = c + sizes[i]
+            if end > span:
+                span = end
+                # 安全剪枝：本顺序跨度已严格超剪枝上界，最终只会更大
+                if span > prune_bound:
+                    aborted = True
+                    break
+        if aborted:
+            continue
 
-    # 由 bin 序列还原每个张量的偏移
-    offsets: dict[str, int] = {}
-    cursor = 0
-    bins_out: list[list[str]] = []
-    for bm in bin_masks:
-        bsize, balign = bin_metrics(bm)
-        start = _align_up(cursor, balign)
-        members: list[str] = []
-        bits = bm
-        while bits:
-            b = bits & -bits
-            i = b.bit_length() - 1
-            offsets[tensors[i].name] = start
-            members.append(tensors[i].name)
-            bits ^= b
-        bins_out.append(sorted(members))
-        cursor = start + bsize
+        off_tuple = tuple(offsets)
+        if span < incumbent or (span == incumbent and off_tuple < best_offsets):
+            incumbent = span
+            best_offsets = off_tuple
+            # 更优解收紧剪枝上界（不低于真实最优，剪枝始终安全）
+            if incumbent < prune_bound:
+                prune_bound = incumbent
+
+    offsets_out = {
+        tensors[i].name: best_offsets[i] for i in range(n)
+    }
+    bins_out = _bins_from_offsets(tensors, best_offsets)
 
     return AllocationResult(
-        feasible=total <= data.budget_bytes,
-        total_bytes=total,
-        offsets=offsets,
+        feasible=incumbent <= data.budget_bytes,
+        total_bytes=incumbent,
+        offsets=offsets_out,
         bins=bins_out,
     )
+
+
+def _bins_from_offsets(
+    tensors: list[TensorSpec], offsets: tuple[int, ...]
+) -> list[list[str]]:
+    """按相同起始偏移把张量分箱；箱按起始偏移升序，箱内 id 字典序。"""
+    groups: dict[int, list[str]] = {}
+    for i, t in enumerate(tensors):
+        groups.setdefault(offsets[i], []).append(t.name)
+    return [sorted(groups[start]) for start in sorted(groups)]
 
 
 # --------------------------------------------------------------------------- #
